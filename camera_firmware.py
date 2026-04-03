@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 
 # Configuration
@@ -13,13 +13,18 @@ from typing import Optional, Tuple
 @dataclass
 class CameraConfig:
     camera_index: int = 0
-    width: int = 3840
-    height: int = 2160
-    autofocus: bool = True
-    startup_warmup_s: float = 0.5
-    led_settle_s: float = 0.15
-    flush_frames_after_led_on: int = 5
+    preferred_resolutions: List[Tuple[int, int]] = field(
+        default_factory=lambda: [
+            (4640, 1456),  # Totem 180 panoramic 4.6K
+            (3520, 1104),  # Totem 180 panoramic 3.5K
+            (1920, 1080),  # Totem 180 full HD
+        ]
+    )
     capture_backend: Optional[int] = cv2.CAP_DSHOW  # Windows-friendly; set None if needed
+    startup_warmup_s: float = 0.75
+    flush_frames_on_startup: int = 5
+    flush_frames_before_capture: int = 3
+    autofocus: bool = False  # Totem 180 is fixed focus
 
 
 @dataclass
@@ -27,6 +32,8 @@ class TriggerConfig:
     capture_threshold: float = 10.0
     trigger_debounce_s: float = 0.25
     polling_interval_s: float = 0.01
+    shutter_interval_s: float = 1.0      # seconds between captures
+    sequence_duration_s: float = 10.0    # total sequence duration sec
 
 
 @dataclass
@@ -44,50 +51,21 @@ class AppConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
 
 
-# SDK light control
+# Totem 180 has no programmable light path in this script,
+# so we keep a no-op light controller for compatibility with your architecture.
 
-class FirmwareLightController:
-    """
-    Placeholder controller for vendor firmware/API light control.
-
-    Replace the methods in this class with actual vendor SDK calls
-    once you know how the camera exposes LED control.
-    """
-
-    def __init__(self) -> None:
-        self._initialized = False
-        self._led_state = False
-
+class NoOpLightController:
     def initialize(self) -> None:
-        logging.info("[FW] Initializing firmware/API controller")
-        self._initialized = True
+        logging.info("[LIGHT] No programmable light controller in use")
 
     def set_led(self, enabled: bool) -> None:
-        """
-        Replace this with the real firmware/API command.
-
-        Sample future pattern:
-            vendor_sdk.set_led(1 if enabled else 0)
-        """
-        if not self._initialized:
-            raise RuntimeError("FirmwareLightController not initialized")
-
-        self._led_state = enabled
-        state = "ON" if enabled else "OFF"
-        logging.info("[FW] LED set to %s", state)
+        logging.debug("[LIGHT] Ignoring LED request: %s", "ON" if enabled else "OFF")
 
     def get_led_state(self) -> bool:
-        return self._led_state
+        return False
 
     def shutdown(self) -> None:
-        if self._initialized:
-            try:
-                self.set_led(False)
-            except Exception as exc:
-                logging.warning("[FW] Failed to force LED OFF during shutdown: %s", exc)
-
-        logging.info("[FW] Shutting down firmware/API controller")
-        self._initialized = False
+        logging.info("[LIGHT] No programmable light controller to shut down")
 
 
 # OpenCV camera capture
@@ -96,6 +74,35 @@ class OpenCVCamera:
     def __init__(self, config: CameraConfig) -> None:
         self.config = config
         self.cap: Optional[cv2.VideoCapture] = None
+        self.negotiated_resolution: Optional[Tuple[int, int]] = None
+        self.negotiated_backend: Optional[int] = None
+
+    def _open_capture(self) -> cv2.VideoCapture:
+        if self.config.capture_backend is not None:
+            cap = cv2.VideoCapture(self.config.camera_index, self.config.capture_backend)
+        else:
+            cap = cv2.VideoCapture(self.config.camera_index)
+
+        if cap is None or not cap.isOpened():
+            raise RuntimeError("Failed to open camera")
+        return cap
+
+    def _try_resolution(self, cap: cv2.VideoCapture, width: int, height: int) -> Tuple[bool, Optional[Tuple[int, int]]]:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        time.sleep(0.2)
+
+        # Flush a few startup frames
+        for _ in range(3):
+            cap.read()
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return False, None
+
+        actual_h, actual_w = frame.shape[:2]
+        return True, (actual_w, actual_h)
 
     def open(self) -> None:
         logging.info("[CV] Opening camera")
@@ -108,20 +115,26 @@ class OpenCVCamera:
         if self.cap is None or not self.cap.isOpened():
             raise RuntimeError("Failed to open camera")
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
-
-        if self.config.autofocus:
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-        else:
-            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-
-        # May be ignored silently by some drivers, which is normal
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Start simple and stable
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
         time.sleep(self.config.startup_warmup_s)
-        logging.info("[CV] Camera opened and warmed up")
 
+        # Flush a few startup frames
+        for _ in range(self.config.flush_frames_on_startup):
+            self.cap.read()
+
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            raise RuntimeError("Camera opened but no usable frame was returned")
+
+        actual_h, actual_w = frame.shape[:2]
+        self.negotiated_resolution = (actual_w, actual_h)
+
+        logging.info("[CV] Camera opened and warmed up")
+        logging.info("[CV] Final negotiated resolution: %sx%s", actual_w, actual_h)
+    
     def close(self) -> None:
         if self.cap is not None:
             logging.info("[CV] Releasing camera")
@@ -164,14 +177,6 @@ class LoadCellInterface:
         logging.info("[LC] Initializing load cell interface")
 
     def read_value(self) -> float:
-        """
-        Replace this with your actual load-cell read.
-
-        Examples:
-        - serial line parse
-        - NI-DAQ read
-        - HX711 / ADC read
-        """
         return 12.34
 
     def should_capture(self, value: float, threshold: float) -> bool:
@@ -188,7 +193,7 @@ class CaptureManager:
         self,
         app_config: AppConfig,
         camera: OpenCVCamera,
-        light: FirmwareLightController,
+        light: NoOpLightController,
         load_cell: LoadCellInterface,
     ) -> None:
         self.app_config = app_config
@@ -207,11 +212,6 @@ class CaptureManager:
 
     def shutdown(self) -> None:
         logging.info("[APP] Shutting down system")
-        try:
-            self.light.set_led(False)
-        except Exception as exc:
-            logging.warning("[APP] Failed to set LED OFF during shutdown: %s", exc)
-
         self.camera.close()
         self.load_cell.shutdown()
         self.light.shutdown()
@@ -227,7 +227,7 @@ class CaptureManager:
     def _build_metadata_path(self, image_path: Path) -> Path:
         return image_path.with_suffix(".json")
 
-    def _save_metadata(self, image_path: Path, value: float) -> Optional[Path]:
+    def _save_metadata(self, image_path: Path, value: float, frame_shape: Tuple[int, int, int]) -> Optional[Path]:
         if not self.app_config.storage.save_metadata_json:
             return None
 
@@ -236,13 +236,20 @@ class CaptureManager:
             "load_value": value,
             "image_path": str(image_path),
             "camera_index": self.app_config.camera.camera_index,
-            "resolution": {
-                "width": self.app_config.camera.width,
-                "height": self.app_config.camera.height,
+            "requested_resolutions": self.app_config.camera.preferred_resolutions,
+            "negotiated_resolution": self.camera.negotiated_resolution,
+            "frame_shape": {
+                "height": frame_shape[0],
+                "width": frame_shape[1],
+                "channels": frame_shape[2] if len(frame_shape) > 2 else 1,
             },
-            "autofocus": self.app_config.camera.autofocus,
-            "led_settle_s": self.app_config.camera.led_settle_s,
-            "flush_frames_after_led_on": self.app_config.camera.flush_frames_after_led_on,
+            "camera_model_notes": {
+                "assumed_model": "IPEVO Totem 180",
+                "focus_mode": "fixed_focus",
+                "panoramic_camera": True,
+            },
+            "flush_frames_on_startup": self.app_config.camera.flush_frames_on_startup,
+            "flush_frames_before_capture": self.app_config.camera.flush_frames_before_capture,
         }
 
         metadata_path = self._build_metadata_path(image_path)
@@ -257,46 +264,98 @@ class CaptureManager:
         return elapsed >= self.app_config.trigger.trigger_debounce_s
 
     def capture_once(self, prefix: str = "capture") -> Tuple[Path, Optional[Path], float]:
-        """
-        Full sequence:
-        1. Read load value
-        2. Turn LED on via firmware/API
-        3. Wait for lighting to settle
-        4. Flush stale frames
-        5. Capture frame
-        6. Turn LED off
-        7. Save image
-        8. Save metadata JSON
-        """
         value = self.load_cell.read_value()
         base_filename = self._build_base_filename(prefix, value)
         output_path = self._build_output_path(base_filename)
 
         logging.info("[APP] Starting capture sequence (load value=%.4f)", value)
 
-        self.light.set_led(True)
-        try:
-            time.sleep(self.app_config.camera.led_settle_s)
-
-            self.camera.flush_frames(self.app_config.camera.flush_frames_after_led_on)
-            frame = self.camera.read_frame()
-
-        finally:
-            # Make sure light is turned off even if capture fails
-            self.light.set_led(False)
+        self.camera.flush_frames(self.app_config.camera.flush_frames_before_capture)
+        frame = self.camera.read_frame()
 
         self.camera.save_frame(frame, output_path)
-        metadata_path = self._save_metadata(output_path, value)
+        metadata_path = self._save_metadata(output_path, value, frame.shape)
 
         self.last_capture_time = time.time()
 
         logging.info("[APP] Capture saved to %s (load value=%.4f)", output_path, value)
         return output_path, metadata_path, value
 
+    def capture_sequence(
+        self,
+        prefix: str = "sequence",
+        shutter_interval_s: Optional[float] = None,
+        sequence_duration_s: Optional[float] = None,
+    ) -> list[Tuple[Path, Optional[Path], float]]:
+        """
+        Capture repeated images at a fixed shutter interval over a total duration.
+
+        Example:
+        - shutter_interval_s = 1.0
+        - sequence_duration_s = 10.0
+
+        This will attempt ~10 captures total, one every second.
+        """
+        interval = (
+            shutter_interval_s
+            if shutter_interval_s is not None
+            else self.app_config.trigger.shutter_interval_s
+        )
+        duration = (
+            sequence_duration_s
+            if sequence_duration_s is not None
+            else self.app_config.trigger.sequence_duration_s
+        )
+
+        if interval <= 0:
+            raise ValueError("shutter_interval_s must be > 0")
+        if duration <= 0:
+            raise ValueError("sequence_duration_s must be > 0")
+
+        logging.info(
+            "[APP] Starting timed capture sequence: interval=%.3fs duration=%.3fs",
+            interval,
+            duration,
+        )
+
+        results: list[Tuple[Path, Optional[Path], float]] = []
+        start_time = time.time()
+        next_capture_time = start_time
+        shot_index = 0
+
+        while True:
+            now = time.time()
+            elapsed = now - start_time
+
+            if elapsed >= duration:
+                break
+
+            sleep_time = next_capture_time - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+            shot_prefix = f"{prefix}_shot_{shot_index:03d}"
+            try:
+                result = self.capture_once(prefix=shot_prefix)
+                results.append(result)
+                logging.info(
+                    "[APP] Sequence shot %03d complete: image=%s",
+                    shot_index,
+                    result[0],
+                )
+            except Exception as exc:
+                logging.exception("[APP] Sequence shot %03d failed: %s", shot_index, exc)
+
+            shot_index += 1
+            next_capture_time += interval
+
+        logging.info(
+            "[APP] Timed capture sequence finished: %d images attempted/saved",
+            len(results),
+        )
+        return results
+
     def run_trigger_loop(self) -> None:
-        """
-        Poll the load cell and capture one image when threshold is met.
-        """
         logging.info("[APP] Entering trigger loop")
         threshold = self.app_config.trigger.capture_threshold
 
@@ -318,6 +377,13 @@ class CaptureManager:
 
             time.sleep(self.app_config.trigger.polling_interval_s)
 
+    def single_test_capture(self, prefix: str = "manual_test") -> None:
+        image_path, metadata_path, value = self.capture_once(prefix=prefix)
+        print(f"Saved image: {image_path}")
+        print(f"Saved metadata: {metadata_path}")
+        print(f"Load value: {value}")
+        print(f"Negotiated resolution: {self.camera.negotiated_resolution}")
+
 
 # Main entry point
 
@@ -329,53 +395,59 @@ def configure_logging() -> None:
 
 
 def main() -> None:
-    configure_logging()
+        configure_logging()
 
-    config = AppConfig(
-        camera=CameraConfig(
-            camera_index=0,
-            width=3840,
-            height=2160,
-            autofocus=True,
-            startup_warmup_s=0.5,
-            led_settle_s=0.15,
-            flush_frames_after_led_on=5,
-            capture_backend=cv2.CAP_DSHOW,  # use None if this causes issues
-        ),
-        trigger=TriggerConfig(
-            capture_threshold=10.0,
-            trigger_debounce_s=0.25,
-            polling_interval_s=0.01,
-        ),
-        storage=StorageConfig(
-            output_dir="captures",
-            image_extension="png",
-            save_metadata_json=True,
-            filename_prefix="capture",
-        ),
-    )
+        config = AppConfig(
+            camera=CameraConfig(
+                camera_index=1,
+                preferred_resolutions=[(1920, 1080)],
+                capture_backend=cv2.CAP_DSHOW,
+                startup_warmup_s=1.0,
+                flush_frames_on_startup=10,
+                flush_frames_before_capture=5,
+                autofocus=False,
+            ),
+            trigger=TriggerConfig(
+                capture_threshold=10.0,
+                trigger_debounce_s=0.25,
+                polling_interval_s=0.01,
+                shutter_interval_s=1.0,
+                sequence_duration_s=10.0,
+            ),
+            storage=StorageConfig(
+                output_dir="captures",
+                image_extension="png",
+                save_metadata_json=True,
+                filename_prefix="capture",
+            ),
+        )
 
-    light = FirmwareLightController()
-    camera = OpenCVCamera(config.camera)
-    load_cell = LoadCellInterface()
-    manager = CaptureManager(config, camera, light, load_cell)
+        light = NoOpLightController()
+        camera = OpenCVCamera(config.camera)
+        load_cell = LoadCellInterface()
+        manager = CaptureManager(config, camera, light, load_cell)
 
-    try:
-        manager.initialize()
+        try:
+            manager.initialize()
 
-        # A) single test capture
-        # image_path, metadata_path, value = manager.capture_once(prefix="manual_test")
-        # print(f"Saved image: {image_path}")
-        # print(f"Saved metadata: {metadata_path}")
-        # print(f"Load value: {value}")
+            # A) single test capture first
+            results = manager.capture_sequence(
+                prefix="totem180_sequence",
+                shutter_interval_s=1.0,
+                sequence_duration_s=10.0,
+            )
 
-        # B) continuous trigger loop
-        manager.run_trigger_loop()
+            print(f"Saved {len(results)} images in shutter sequence")
+            for image_path, metadata_path, value in results:
+                print(f"Image: {image_path} | Metadata: {metadata_path} | Load: {value}")
 
-    except KeyboardInterrupt:
-        logging.info("[APP] Interrupted by user")
-    finally:
-        manager.shutdown()
+            # B) then switch to continuous trigger loop when ready
+            # manager.run_trigger_loop() - use when programming directly onto carousel
+
+        except KeyboardInterrupt:
+            logging.info("[APP] Interrupted by user")
+        finally:
+            manager.shutdown()
 
 
 if __name__ == "__main__":
