@@ -52,7 +52,6 @@ class AppConfig:
 
 
 # Totem 180 has no programmable light path in this script,
-# so we keep a no-op light controller for compatibility with your architecture.
 
 class NoOpLightController:
     def initialize(self) -> None:
